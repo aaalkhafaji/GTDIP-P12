@@ -1,0 +1,62 @@
+import os
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from google.colab import files
+from mpl_toolkits.mplot3d import Axes3D
+
+# 1. Setup Export Directory
+FIG_DIR = 'stackelberg_figures_paper2'
+os.makedirs(FIG_DIR, exist_ok=True)
+
+def save_fig(fig, filename):
+    filepath = os.path.join(FIG_DIR, filename)
+    fig.savefig(filepath, dpi=300, bbox_inches='tight')
+    print(f"Saved: {filepath}")
+
+# 2. Figure 1: Hierarchical Topology
+def plot_topology():
+    fig = plt.figure(figsize=(6, 5))
+    G = nx.DiGraph()
+    G.add_nodes_from(['Green', 'Red', 'Blue'])
+    G.add_edges_from([('Green', 'Red'), ('Green', 'Blue')])
+    
+    pos = {'Green': (0, 1), 'Red': (-1, 0), 'Blue': (1, 0)}
+    nx.draw(G, pos, with_labels=True, node_size=2000, 
+            node_color=['#2ecc71', '#e74c3c', '#3498db'], 
+            font_weight='bold', font_color='white', arrowsize=20, width=2)
+    plt.title("Stackelberg Hierarchical Topology")
+    save_fig(fig, "fig_stackelberg_topology.png")
+    plt.close()
+
+# 3. Figure 2: Bilevel Optimization Manifold
+def plot_bilevel():
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Create a "Reaction Manifold" (the curve the follower is forced to follow)
+    u_g = np.linspace(-2, 2, 50)
+    R_ug = u_g**2  # The manifold imposed by the follower's reaction
+    
+    # Leader's objective surface
+    X, Y = np.meshgrid(np.linspace(-2, 2, 50), np.linspace(-2, 2, 50))
+    Z = (X**2 + Y**2) + 2  # The Leader's objective function
+    
+    ax.plot_surface(X, Y, Z, alpha=0.3, cmap='viridis')
+    ax.plot(u_g, R_ug, u_g**2 + R_ug**2 + 2, color='r', linewidth=3, label='Reaction Manifold $\mathcal{R}(u_G)$')
+    
+    ax.set_xlabel('$u_G$'); ax.set_ylabel('Follower $u_F$'); ax.set_zlabel('$J_G$')
+    ax.set_title("Bilevel Optimization Landscape")
+    ax.legend()
+    save_fig(fig, "fig_bilevel_landscape.png")
+    plt.close()
+
+# Run generators
+plot_topology()
+plot_bilevel()
+
+# 4. Zip and Download
+zip_filename = "Stackelberg_Figures_Paper2"
+shutil.make_archive(zip_filename, 'zip', FIG_DIR)
+files.download(f"{zip_filename}.zip")
