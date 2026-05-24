@@ -1,0 +1,79 @@
+import os
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from google.colab import files
+
+# 1. Setup Export Directory
+FIG_DIR = 'algebraic_figures_paper2'
+os.makedirs(FIG_DIR, exist_ok=True)
+
+def save_fig(fig, filename):
+    filepath = os.path.join(FIG_DIR, filename)
+    fig.savefig(filepath, dpi=300, bbox_inches='tight')
+    print(f"Saved: {filepath}")
+
+# 2. Figure 1: Resolvent Projection (Minty's Theorem visualization)
+def plot_resolvent_projection():
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Create the smooth Sobolev Manifold W^(1,2)
+    X, Y = np.meshgrid(np.linspace(-2, 2, 40), np.linspace(-2, 2, 40))
+    Z_manifold = np.sin(X) * np.cos(Y) * 0.5
+    
+    ax.plot_surface(X, Y, Z_manifold, alpha=0.5, cmap='Blues', edgecolors='none')
+    
+    # Noisy Point in L2 (Exogenous Perturbation)
+    noisy_point = [1.0, 1.0, 2.5]
+    ax.scatter(*noisy_point, color='red', s=100, label='Perturbed State $I \in L^2(\Omega)$')
+    
+    # Projected Point on the Manifold
+    projected_point = [1.0, 1.0, np.sin(1.0)*np.cos(1.0)*0.5]
+    ax.scatter(*projected_point, color='green', s=100, label='Best-Response $\mathcal{BR}_i(I) \in W^{1,2}(\Omega)$')
+    
+    # Projection arrow
+    ax.quiver(noisy_point[0], noisy_point[1], noisy_point[2],
+              0, 0, projected_point[2] - noisy_point[2], 
+              color='black', arrow_length_ratio=0.1, linewidth=2, linestyle='dashed')
+              
+    ax.set_title("Non-Expansive Best-Response Projection")
+    ax.axis('off')
+    ax.legend()
+    save_fig(fig, "fig_resolvent_projection.png")
+    plt.close()
+
+# 3. Figure 2: The Skewed Strategic Noise Manifold
+def plot_skewed_manifold():
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Base Manifold
+    X, Y = np.meshgrid(np.linspace(-2, 2, 40), np.linspace(-2, 2, 40))
+    # Create a "valley" representing the Leader's established gradient
+    Z_skewed = (X - Y)**2 * 1.5 + (X + Y)**2 * 0.2 
+    
+    ax.plot_surface(X, Y, Z_skewed, alpha=0.7, cmap='magma', edgecolors='none')
+    
+    # Path of least resistance (The Stackelberg constraint)
+    line_x = np.linspace(-2, 2, 50)
+    line_y = line_x
+    line_z = (line_x - line_y)**2 * 1.5 + (line_x + line_y)**2 * 0.2
+    
+    ax.plot(line_x, line_y, line_z, color='cyan', linewidth=4, label="Leader's Structural Subspace $\mathcal{S}_G$")
+    
+    ax.set_title("Strategic Noise Manifold (Skewed Projection)")
+    ax.axis('off')
+    ax.legend()
+    save_fig(fig, "fig_skewed_manifold.png")
+    plt.close()
+
+# Run generators
+plot_resolvent_projection()
+plot_skewed_manifold()
+
+# 4. Zip and Download
+zip_filename = "Algebraic_Figures_Paper2"
+shutil.make_archive(zip_filename, 'zip', FIG_DIR)
+files.download(f"{zip_filename}.zip")
