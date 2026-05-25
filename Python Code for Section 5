@@ -1,0 +1,100 @@
+import os
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+from google.colab import files
+
+# Enforce FP64 precision
+np.set_printoptions(precision=16)
+
+FIG_DIR = 'duopoly_geometry_figures'
+os.makedirs(FIG_DIR, exist_ok=True)
+
+def save_fig(fig, filename):
+    filepath = os.path.join(FIG_DIR, filename)
+    fig.savefig(filepath, dpi=300, bbox_inches='tight')
+    print(f"Saved: {filepath}")
+
+def plot_reaction_curves():
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # 1. Define game parameters (simulating a noisy pixel)
+    I_R = 120.0  # Noisy Red observation
+    I_G = 160.0  # Noisy Green observation
+    lambda_R = 1.0
+    lambda_G = 1.2
+    gamma = 2.0
+    
+    # 2. Continuous strategy space (Pixel Intensities)
+    y_vals = np.linspace(80, 200, 400, dtype=np.float64) # Green strategies
+    x_vals = np.linspace(80, 200, 400, dtype=np.float64) # Red strategies
+    
+    # 3. Compute continuous reaction curves (Convex combinations)
+    # Red's reaction to Green: x = R_R(y)
+    slope_R = gamma / (lambda_R + gamma)
+    R_R = (lambda_R / (lambda_R + gamma)) * I_R + slope_R * y_vals
+    
+    # Green's reaction to Red: y = R_G(x)
+    slope_G = gamma / (lambda_G + gamma)
+    R_G = (lambda_G / (lambda_G + gamma)) * I_G + slope_G * x_vals
+    
+    # Plot reaction lines
+    ax.plot(y_vals, R_R, color='#e74c3c', linewidth=3, label=r"Follower (Red) Reaction $\mathcal{R}_R(y)$")
+    ax.plot(R_G, x_vals, color='#3498db', linewidth=3, linestyle='--', label=r"Reactive Leader (Nash) $\mathcal{R}_G(x)$")
+    
+    # 4. Calculate Nash Equilibrium (Intersection)
+    # y_NE = R_G(R_R(y_NE))
+    y_NE = (lambda_G * I_G * (lambda_R + gamma) + gamma * lambda_R * I_R) / \
+           ((lambda_G + gamma) * (lambda_R + gamma) - gamma**2)
+    x_NE = (lambda_R / (lambda_R + gamma)) * I_R + slope_R * y_NE
+    
+    ax.scatter(y_NE, x_NE, color='black', s=100, zorder=5)
+    ax.annotate('Nash Equilibrium (NE)', xy=(y_NE, x_NE), xytext=(y_NE - 25, x_NE + 10),
+                arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=7),
+                fontsize=11, fontweight='bold')
+    
+    # 5. Calculate Stackelberg Equilibrium (Tangency)
+    # Leader minimizes: J_G(y, R_R(y)) = 0.5 * L_G * (y - I_G)^2 + 0.5 * gamma * (y - R_R(y))^2
+    # Derivative w.r.t y: L_G(y - I_G) + gamma * (y - R_R(y)) * (1 - slope_R) = 0
+    # where (1 - slope_R) = lambda_R / (lambda_R + gamma)
+    coef_1 = lambda_G
+    coef_2 = gamma * (1 - slope_R)**2
+    y_SE = (lambda_G * I_G + gamma * (1 - slope_R) * (lambda_R / (lambda_R + gamma)) * I_R) / (coef_1 + coef_2)
+    x_SE = (lambda_R / (lambda_R + gamma)) * I_R + slope_R * y_SE
+    
+    ax.scatter(y_SE, x_SE, color='#27ae60', s=130, marker='*', zorder=6)
+    ax.annotate('Strong Stackelberg\nEquilibrium (SSE)', xy=(y_SE, x_SE), xytext=(y_SE + 5, x_SE - 15),
+                arrowprops=dict(facecolor='#27ae60', shrink=0.05, width=1.5, headwidth=7),
+                fontsize=11, fontweight='bold', color='#27ae60')
+    
+    # 6. Iso-cost contours for the Leader (Green)
+    Y_grid, X_grid = np.meshgrid(y_vals, x_vals)
+    J_G_grid = 0.5 * lambda_G * (Y_grid - I_G)**2 + 0.5 * gamma * (Y_grid - X_grid)**2
+    
+    # Plot contour specifically passing through the Stackelberg equilibrium
+    J_G_SE = 0.5 * lambda_G * (y_SE - I_G)**2 + 0.5 * gamma * (y_SE - x_SE)**2
+    levels = [J_G_SE, J_G_SE + 50, J_G_SE + 200, J_G_SE + 500, J_G_SE + 1000]
+    
+    CS = ax.contour(Y_grid, X_grid, J_G_grid, levels=levels, colors='#2ecc71', alpha=0.6, linewidths=1.5)
+    ax.plot([], [], color='#2ecc71', label="Leader Iso-Cost Contours $J_G(x,y)$") # For legend
+    
+    # Formatting
+    ax.set_title("Computational Geometry of the Pixel Duopoly", fontweight='bold', pad=15)
+    ax.set_xlabel("Leader Strategy (Green Channel Intensity $y$)")
+    ax.set_ylabel("Follower Strategy (Red Channel Intensity $x$)")
+    ax.legend(loc='upper left')
+    ax.grid(True, linestyle=':', alpha=0.7)
+    
+    # Lock aspect ratio so tangency is visually accurate
+    ax.set_aspect('equal', adjustable='box')
+    
+    save_fig(fig, "fig_reaction_curves.png")
+    plt.close()
+
+# Execute generation
+plot_reaction_curves()
+
+# Compress and ready for download
+zip_filename = "Duopoly_Geometry_Figures"
+shutil.make_archive(zip_filename, 'zip', FIG_DIR)
+files.download(f"{zip_filename}.zip")
