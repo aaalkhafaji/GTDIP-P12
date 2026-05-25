@@ -1,0 +1,97 @@
+import os
+import shutil
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from google.colab import files
+
+# Enforce Hardware-Level Precision Constraint (FP64)
+np.set_printoptions(precision=16)
+
+FIG_DIR = 'stackelberg_hardware_figures'
+os.makedirs(FIG_DIR, exist_ok=True)
+
+def save_fig(fig, filename):
+    filepath = os.path.join(FIG_DIR, filename)
+    fig.savefig(filepath, dpi=300, bbox_inches='tight')
+    print(f"Saved: {filepath}")
+
+# Figure 1: Hardware-Bounded Stackelberg Topology
+def plot_constrained_topology():
+    fig, ax = plt.subplots(figsize=(6, 5))
+    G = nx.DiGraph()
+    G.add_nodes_from(['Green\n(Leader)', 'Red\n(Follower)', 'Blue\n(Follower)'])
+    G.add_edges_from([('Green\n(Leader)', 'Red\n(Follower)'), 
+                      ('Green\n(Leader)', 'Blue\n(Follower)')])
+    
+    pos = {'Green\n(Leader)': (0, 1), 'Red\n(Follower)': (-1, 0), 'Blue\n(Follower)': (1, 0)}
+    
+    # Draw graph with distinct leader/follower hardware colors
+    nx.draw_networkx_nodes(G, pos, nodelist=['Green\n(Leader)'], node_color='#2ecc71', node_size=3500, edgecolors='black', linewidths=2)
+    nx.draw_networkx_nodes(G, pos, nodelist=['Red\n(Follower)', 'Blue\n(Follower)'], node_color=['#e74c3c', '#3498db'], node_size=3000, edgecolors='black', linewidths=2)
+    nx.draw_networkx_labels(G, pos, font_weight='bold', font_color='white', font_size=10)
+    nx.draw_networkx_edges(G, pos, arrowsize=25, width=3, edge_color='#7f8c8d')
+    
+    # Annotate constraints
+    plt.text(0, 0.5, 'CFL Stable\nReaction Mappings $\mathcal{R}_i$', 
+             horizontalalignment='center', verticalalignment='center', 
+             fontsize=10, bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray', boxstyle='round,pad=0.5'))
+             
+    plt.title("Hardware Topology: Stackelberg Information Flow", pad=20, fontweight='bold')
+    plt.axis('off')
+    save_fig(fig, "fig_stackelberg_topology.png")
+    plt.close()
+
+# Figure 2: Bilevel Landscape with Neumann Constraints
+def plot_bilevel_landscape():
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # FP64 domain generation
+    grid_res = 60
+    u_g = np.linspace(-2.5, 2.5, grid_res, dtype=np.float64)
+    u_f = np.linspace(-2.5, 2.5, grid_res, dtype=np.float64)
+    X, Y = np.meshgrid(u_g, u_f)
+    
+    # Leader's objective surface: Non-convex global landscape
+    # Simulated Neumann flattening at the boundaries via exponential damping
+    boundary_damping = np.exp(-0.05 * (X**4 + Y**4))
+    Z = ((X**2 + 0.5 * Y**2) + 2 * np.sin(X*Y)) * boundary_damping
+    
+    # Followers' continuous reaction mapping R_i(u_G)
+    R_ug = 0.5 * u_g + np.sin(u_g)
+    
+    # Cost specifically along the reaction manifold
+    Z_manifold = ((u_g**2 + 0.5 * R_ug**2) + 2 * np.sin(u_g*R_ug)) * np.exp(-0.05 * (u_g**4 + R_ug**4))
+    
+    surf = ax.plot_surface(X, Y, Z, alpha=0.4, cmap='viridis', edgecolor='none')
+    
+    # The Reaction Manifold strictly bounded by FP64
+    ax.plot(u_g, R_ug, Z_manifold + 0.2, color='cyan', linewidth=4, 
+            label="Followers' Reaction Manifold $\mathcal{R}_{\mathcal{F}}(u_G)$", zorder=5)
+            
+    # Mark the Strong Stackelberg Equilibrium
+    min_idx = np.argmin(Z_manifold)
+    ax.scatter(u_g[min_idx], R_ug[min_idx], Z_manifold[min_idx] + 0.2, 
+               color='red', s=150, label='Strong Stackelberg Equilibrium', zorder=10)
+    
+    ax.set_xlabel("Leader Strategy (Green) $u_G$")
+    ax.set_ylabel("Follower Strategy (R/B) $u_{\mathcal{F}}$")
+    ax.set_zlabel("Leader Objective $J_G$")
+    ax.set_title("FP64 Bilevel Landscape with Boundary Damping", fontweight='bold')
+    ax.legend(loc='upper right')
+    
+    # View angle to highlight the non-convexity
+    ax.view_init(elev=25, azim=135)
+    
+    save_fig(fig, "fig_bilevel_landscape.png")
+    plt.close()
+
+# Generate and Package
+plot_constrained_topology()
+plot_bilevel_landscape()
+
+zip_filename = "Stackelberg_Hardware_Figures"
+shutil.make_archive(zip_filename, 'zip', FIG_DIR)
+files.download(f"{zip_filename}.zip")
