@@ -1,485 +1,527 @@
+#!/usr/bin/env python3
+"""Reproducible figures for the reliability-adaptive Stackelberg manuscript.
+
+Every panel is either (i) generated from an explicitly stated specialization
+of the manuscript model or (ii) labeled as a diagnostic illustration.  The
+script deliberately does not describe a toy computation as a full execution
+of Algorithm 1.  PNG files are used by LaTeX; vector PDF copies and CSV logs
+are exported for publication and audit.
+"""
+
+from __future__ import annotations
+
+import json
 import os
 import shutil
-import numpy as np
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-tsp-cache")
+
+import matplotlib as mpl
 import matplotlib.pyplot as plt
-import networkx as nx
-import seaborn as sns
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.patches import Rectangle
-from google.colab import files
+import numpy as np
+import pandas as pd
+from matplotlib.patches import FancyBboxPatch, Rectangle
+from scipy.linalg import eigh
+from scipy.sparse import bmat, diags, eye, kron
+from scipy.sparse.linalg import eigsh, spsolve
 
-# ==========================================
-# 0. Global Setup & FP64 Precision Enforcement
-# ==========================================
-# Enforce strictly 64-bit precision for latent physics
-np.set_printoptions(precision=16)
+# Colab-specific import for downloading files
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
 
-FIG_DIR = 'IEEE_TSP_Figures_Final'
-os.makedirs(FIG_DIR, exist_ok=True)
 
-def save_fig(fig, filename):
-    filepath = os.path.join(FIG_DIR, filename)
-    fig.savefig(filepath, dpi=300, bbox_inches='tight')
-    print(f"Saved: {filepath}")
+SEED = 20260813
+SINGLE = 3.45
+DOUBLE = 7.16
+BLUE = "#0072B2"
+ORANGE = "#D55E00"
+GREEN = "#009E73"
+PURPLE = "#7B3294"
+GRAY = "#555555"
 
-# ==========================================
-# MATHEMATICAL SOLVER (ALGORITHM 1)
-# ==========================================
-def run_numerical_solvers(grid_size=50):
-    """
-    Executes actual finite-difference solvers to generate empirical data.
-    Eliminates all synthetic mockups to provide rigorous proof of Algorithm 1.
-    """
-    # 1. True Latent Structural Edge in FP64 (3-Channel RGB Tensor)
-    x, y = np.meshgrid(np.linspace(-1, 1, grid_size), np.linspace(-1, 1, grid_size))
-    base_edge = np.where(x - y > 0, 220.0, 50.0)
-    true_X = np.stack([base_edge, base_edge, base_edge]).astype(np.float64)
-    
-    # 2. Exogenous AWGN
-    np.random.seed(42)
-    noise = np.random.normal(0, 45, true_X.shape)
-    # Physical sensor limitation
-    Y = np.clip(true_X + noise, 0, 255.0) 
-    
-    iters = 100
-    tau = 0.12 # Step size deliberately chosen near CFL boundary to test stability
+
+def configure_style() -> None:
+    mpl.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+        "font.size": 8,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "legend.fontsize": 6.8,
+        "axes.linewidth": 0.75,
+        "lines.linewidth": 1.5,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "savefig.dpi": 400,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.02,
+    })
+
+
+def save_figure(fig: plt.Figure, out: Path, stem: str) -> None:
+    fig.savefig(out / f"{stem}.png", dpi=400, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out / f"{stem}.pdf", bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+
+
+def neumann_laplacian(n: int):
+    d = diags([-np.ones(n - 1), np.ones(n - 1)], [0, 1], shape=(n - 1, n))
+    l1 = d.T @ d
+    return kron(eye(n), l1) + kron(l1, eye(n))
+
+
+def synthetic_equal_edge_problem(n: int = 56):
+    """Equal-edge RGB stress test with unequal channel noise."""
+    rng = np.random.default_rng(SEED)
+    yy, xx = np.mgrid[0:n, 0:n] / (n - 1)
+    base = 0.18 + 0.55 * (xx > 0.24 + 0.52 * yy)
+    base += 0.14 * np.exp(-((xx - 0.72) ** 2 + (yy - 0.27) ** 2) / 0.018)
+    base = np.clip(base, 0.0, 1.0)
+    truth = np.stack([base, base, base])
+    sigma = np.array([0.13, 0.045, 0.16])
+    noisy = np.clip(truth + rng.normal(size=truth.shape) * sigma[:, None, None], 0, 1)
+    invvar = sigma ** -2
+    weights = invvar / invvar.sum()
+    guide = np.tensordot(weights, noisy, axes=(0, 0))
+    return truth, noisy, sigma, weights, guide
+
+
+def solve_quadratic_followers(noisy, guide, lap, alpha, xi, rho):
+    """Interior quadratic specialization of the follower potential."""
+    c, n, _ = noisy.shape
+    ident = eye(n * n, format="csr")
+    blocks = []
+    for i in range(c):
+        row = []
+        for j in range(c):
+            if i == j:
+                row.append(ident + (alpha + xi + rho * (c - 1)) * lap)
+            else:
+                row.append(-rho * lap)
+        blocks.append(row)
+    hess = bmat(blocks, format="csr")
+    lg = lap @ guide.ravel()
+    rhs = np.concatenate([noisy[i].ravel() + xi * lg for i in range(c)])
+    solution = spsolve(hess, rhs).reshape(c, n, n)
+    return np.clip(solution, 0, 1), hess, rhs
+
+
+def spectral_angle_map(estimate, truth):
+    a = estimate.reshape(estimate.shape[0], -1)
+    b = truth.reshape(truth.shape[0], -1)
+    cosine = np.sum(a * b, axis=0) / (
+        np.linalg.norm(a, axis=0) * np.linalg.norm(b, axis=0) + 1e-12
+    )
+    return np.rad2deg(np.arccos(np.clip(cosine, -1, 1))).reshape(truth.shape[1:])
+
+
+def quadratic_diagnostics(noisy, guide, lap, alpha=0.20, xi=1.0, rho=0.05):
+    solution, hess, rhs = solve_quadratic_followers(noisy, guide, lap, alpha, xi, rho)
+    u_star = solution.ravel()
+    u = noisy.ravel().copy()
+    lmax = float(eigsh(hess, k=1, which="LA", return_eigenvectors=False)[0])
+    mu = float(eigsh(hess, k=1, which="SA", return_eigenvectors=False)[0])
+    tau = 2.0 / (lmax + mu)
+    q = (lmax - mu) / (lmax + mu)
+
+    def objective(v):
+        return 0.5 * float(v @ (hess @ v)) - float(rhs @ v)
+
+    p_star = objective(u_star)
+    rows = []
+    for k in range(120):
+        grad = hess @ u - rhs
+        rows.append({
+            "iteration": k,
+            "objective_gap": max(objective(u) - p_star, 1e-18),
+            "relative_distance": np.linalg.norm(u - u_star) / np.linalg.norm(noisy.ravel() - u_star),
+            "gradient_rms": np.linalg.norm(grad) / np.sqrt(grad.size),
+            "theory_envelope": q ** k,
+        })
+        u = u - tau * grad
+    data = pd.DataFrame(rows)
+    if np.any(np.diff(data["objective_gap"].to_numpy()) > 1e-9):
+        raise RuntimeError("The admissible-step objective trace is not monotone.")
+    return data, {"mu": mu, "L": lmax, "tau": tau, "q": q}
+
+
+def plot_topology(out: Path) -> None:
+    fig, ax = plt.subplots(figsize=(DOUBLE, 2.0))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 3.1)
+    ax.axis("off")
+
+    def box(x, y, w, h, text, color):
+        patch = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.05",
+                               fc=color, ec="black", lw=0.8)
+        ax.add_patch(patch)
+        ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=7)
+
+    def arrow(a, b, **kw):
+        ax.annotate("", xy=b, xytext=a,
+                    arrowprops=dict(arrowstyle="->", lw=1.1, color=GRAY, **kw))
+
+    box(.15, 1.55, 1.35, .75, "Observations\n" + r"$Y,\Sigma_N$", "#E8E8E8")
+    box(2.0, 1.55, 1.45, .75, "Identified mixture\n" + r"$a(q)$", "#D9EAF7")
+    box(3.95, 1.55, 1.45, .75, "Guide and graph\n" + r"$g_\ell,L(g_\ell)$", "#D9F0E3")
+    box(5.9, 1.55, 1.45, .75, "$C$-Follower\n" + r"equilibrium $u^\star$", "#FBE3D5")
+    box(7.85, 1.55, 1.35, .75, "MC-SURE\nand adjoints", "#EEE2F4")
+    box(4.15, .20, 1.15, .65, "Leader update", "#FFF2CC")
+    for x0, x1 in [(1.5, 2.0), (3.45, 3.95), (5.4, 5.9), (7.35, 7.85)]:
+        arrow((x0, 1.93), (x1, 1.93))
+    arrow((8.52, 1.55), (5.3, .53), connectionstyle="arc3,rad=-.17")
+    arrow((4.15, .53), (2.72, 1.55), connectionstyle="arc3,rad=-.20")
+    ax.text(5.0, 2.75, "Leader anticipates the unique follower response",
+            ha="center", va="center", fontsize=8, weight="bold")
+    fig.tight_layout(pad=.2)
+    save_figure(fig, out, "fig_stackelberg_topology")
+
+
+def scalar_parameters():
+    return {"I_R": 0.625, "I_G": 0.8, "lambda_R": 1.5,
+            "lambda_G": 1.0, "gamma": 1.0}
+
+
+def scalar_equilibria(p):
+    ir, ig = p["I_R"], p["I_G"]
+    lr, lg, gamma = p["lambda_R"], p["lambda_G"], p["gamma"]
+    a = lr / (lr + gamma)
+    y_se = (lg * ig + gamma * a * a * ir) / (lg + gamma * a * a)
+    x_se = a * ir + (1 - a) * y_se
+    mat = np.array([[lr + gamma, -gamma], [-gamma, lg + gamma]])
+    x_ne, y_ne = np.linalg.solve(mat, np.array([lr * ir, lg * ig]))
+    return a, (y_ne, x_ne), (y_se, x_se)
+
+
+def plot_bilevel_landscape(out: Path) -> None:
+    p = scalar_parameters()
+    a, _, se = scalar_equilibria(p)
+    y = np.linspace(0, 1, 90)
+    x = np.linspace(0, 1, 90)
+    yy, xx = np.meshgrid(y, x)
+    jl = .5 * p["lambda_G"] * (yy - p["I_G"]) ** 2 + .5 * p["gamma"] * (yy - xx) ** 2
+    reaction = a * p["I_R"] + (1 - a) * y
+    jl_reaction = .5 * p["lambda_G"] * (y - p["I_G"]) ** 2 + .5 * p["gamma"] * (y - reaction) ** 2
+
+    fig = plt.figure(figsize=(SINGLE, 2.65))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(yy, xx, jl, cmap="viridis", alpha=.58, linewidth=0, antialiased=True)
+    ax.plot(y, reaction, jl_reaction, color="#00BFC4", lw=2.2,
+            label=r"reaction manifold $x^\star(y)$")
+    zse = .5 * p["lambda_G"] * (se[0] - p["I_G"]) ** 2 + .5 * p["gamma"] * (se[0] - se[1]) ** 2
+    ax.scatter(*se, zse, color=ORANGE, s=25, depthshade=False, label="Stackelberg point")
+    ax.set_xlabel("Leader $y$", labelpad=-1)
+    ax.set_ylabel("Follower $x$", labelpad=-1)
+    ax.set_zlabel(r"$J_L$", labelpad=-1)
+    ax.tick_params(pad=-2)
+    ax.view_init(elev=24, azim=-130)
+    ax.legend(loc="upper left", frameon=True)
+    fig.subplots_adjust(left=.01, right=.96, bottom=.02, top=.98)
+    save_figure(fig, out, "fig_bilevel_landscape")
+
+
+def plot_resolvent(out: Path) -> None:
+    points = np.array([[-1.55, 1.35], [-1.35, -.45], [-.55, 1.65],
+                       [.35, 1.45], [1.45, .75], [1.55, -1.35], [.25, -1.55]])
+    threshold = .35
+    prox = np.sign(points) * np.maximum(np.abs(points) - threshold, 0)
+    prox = np.clip(prox, -1, 1)
+    fig, ax = plt.subplots(figsize=(SINGLE, 2.65))
+    ax.add_patch(Rectangle((-1, -1), 2, 2, fc="#D9EAF7", ec=BLUE, lw=1.1, alpha=.55))
+    for y, b in zip(points, prox):
+        ax.annotate("", xy=b, xytext=y,
+                    arrowprops=dict(arrowstyle="->", color="#777777", lw=.9))
+    ax.scatter(points[:, 0], points[:, 1], color=ORANGE, s=22, label="data argument $y$")
+    ax.scatter(prox[:, 0], prox[:, 1], color=GREEN, s=22, label=r"proximal response $\mathcal{B}(y)$")
+    ax.text(0, .05, r"box $\mathcal{C}$", color=BLUE, ha="center", va="center")
+    ax.set(xlim=(-1.8, 1.8), ylim=(-1.8, 1.8), xlabel="$y_1$", ylabel="$y_2$")
+    ax.set_aspect("equal")
+    ax.grid(alpha=.18)
+    ax.legend(loc="lower left")
+    fig.tight_layout(pad=.2)
+    save_figure(fig, out, "fig_resolvent_projection")
+
+
+def plot_skewed_manifold(out: Path) -> None:
+    z1 = np.linspace(-2.4, 2.4, 180)
+    z2 = np.linspace(-2.4, 2.4, 180)
+    xx, yy = np.meshgrid(z1, z2)
+    parallel = (xx + yy) / np.sqrt(2)
+    mismatch = (xx - yy) / np.sqrt(2)
+    energy = .18 * parallel ** 2 + 2.5 * mismatch ** 2
+    fig, ax = plt.subplots(figsize=(SINGLE, 2.65))
+    ax.contour(xx, yy, energy, levels=[.15, .35, .75, 1.4, 2.4, 3.8],
+               colors=[PURPLE], linewidths=.9)
+    ax.plot(z1, z1, color="#00BFC4", lw=2, label=r"guide-consistent direction")
+    start = np.array([-1.55, 1.25])
+    grad = np.array([.18 * (start.sum()) + 2.5 * (start[0] - start[1]),
+                     .18 * (start.sum()) - 2.5 * (start[0] - start[1])])
+    end = start - .18 * grad
+    ax.annotate("", xy=end, xytext=start,
+                arrowprops=dict(arrowstyle="->", color=ORANGE, lw=1.7))
+    ax.text(start[0], start[1] + .17, r"penalty on $s(u_c)-s(g)$", ha="left", color=ORANGE)
+    ax.set(xlabel=r"feature $s(u_c)$", ylabel=r"guide feature $s(g)$",
+           xlim=(-2.4, 2.4), ylim=(-2.4, 2.4))
+    ax.set_aspect("equal")
+    ax.grid(alpha=.16)
+    ax.legend(loc="lower right")
+    fig.tight_layout(pad=.2)
+    save_figure(fig, out, "fig_skewed_manifold")
+
+
+def plot_potential_descent(out: Path, diagnostics: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(SINGLE, 2.45))
+    normalized = diagnostics.objective_gap.to_numpy() / diagnostics.objective_gap.iloc[0]
+    normalized = np.maximum(normalized, 1e-14)
+    ax.semilogy(diagnostics.iteration, normalized,
+                color=PURPLE, label=r"normalized $P(u^k)-P(u^\star)$")
+    ax.set(xlabel="iteration $k$", ylabel="normalized potential gap", ylim=(1e-14, 2))
+    ax.grid(True, which="both", alpha=.24)
+    ax.legend(loc="upper right")
+    fig.tight_layout(pad=.2)
+    save_figure(fig, out, "fig_potential_descent")
+
+
+def plot_geometric_convergence(out: Path, diagnostics: pd.DataFrame, constants: dict) -> None:
+    stable = diagnostics.relative_distance.to_numpy()
+    envelope = diagnostics.theory_envelope.to_numpy()
+    k = diagnostics.iteration.to_numpy()
+    # A one-dimensional worst-curvature mode shows what can occur beyond 2/L.
+    tau_bad = 2.08 / constants["L"]
+    bad_factor = abs(1 - tau_bad * constants["L"])
+    bad = bad_factor ** k
+    fig, ax = plt.subplots(figsize=(SINGLE, 2.55))
+    ax.semilogy(k, envelope, "--", color="black", label=r"proved envelope $q(\tau)^k$")
+    ax.semilogy(k, stable, color=BLUE, label="admissible step")
+    ax.semilogy(k[:35], bad[:35], "-.", color=ORANGE,
+                label=r"inadmissible local mode, $\tau>2/L_P$")
+    ax.set(xlabel="iteration $k$", ylabel=r"relative distance to $u^\star$")
+    ax.grid(True, which="both", alpha=.24)
+    ax.legend(loc="lower left")
+    fig.tight_layout(pad=.2)
+    save_figure(fig, out, "fig_geometric_convergence")
+
+
+def plot_reaction_curves(out: Path) -> None:
+    p = scalar_parameters()
+    a, ne, se = scalar_equilibria(p)
+    y = np.linspace(0, 1, 300)
+    x_react = a * p["I_R"] + (1 - a) * y
+    x = np.linspace(0, 1, 300)
+    y_leader = (p["lambda_G"] * p["I_G"] + p["gamma"] * x) / (p["lambda_G"] + p["gamma"])
+    yy, xx = np.meshgrid(y, x)
+    jl = .5 * p["lambda_G"] * (yy - p["I_G"]) ** 2 + .5 * p["gamma"] * (yy - xx) ** 2
+    jse = .5 * p["lambda_G"] * (se[0] - p["I_G"]) ** 2 + .5 * p["gamma"] * (se[0] - se[1]) ** 2
+    levels = jse + np.array([.002, .01, .03, .07, .14])
+    fig, ax = plt.subplots(figsize=(SINGLE, 2.8))
+    ax.plot(y, x_react, color=ORANGE, label=r"Follower $x^\star(y)$")
+    ax.plot(y_leader, x, "--", color=BLUE, label="simultaneous Leader BR")
+    ax.contour(yy, xx, jl, levels=levels, colors=GREEN, linewidths=.65, alpha=.75)
+    ax.scatter(*ne, color="black", marker="s", s=22, zorder=5, label="NE")
+    ax.scatter(*se, color=PURPLE, marker="*", s=48, zorder=6, label="SE")
+    ax.set(xlabel="Leader strategy $y$", ylabel="Follower strategy $x$",
+           xlim=(.4, .9), ylim=(.4, .9))
+    ax.set_aspect("equal")
+    ax.grid(alpha=.18)
+    ax.legend(loc="lower right", ncol=2)
+    fig.tight_layout(pad=.2)
+    save_figure(fig, out, "fig_reaction_curves")
+
+
+def plot_heatmap(out: Path, truth, baseline, proposed) -> pd.DataFrame:
+    base_sam = spectral_angle_map(baseline, truth)
+    prop_sam = spectral_angle_map(proposed, truth)
+    vmax = float(np.percentile(np.concatenate([base_sam.ravel(), prop_sam.ravel()]), 99))
+    fig, axes = plt.subplots(1, 2, figsize=(DOUBLE, 2.35), constrained_layout=True)
+    im = axes[0].imshow(base_sam, cmap="cividis", vmin=0, vmax=vmax)
+    axes[1].imshow(prop_sam, cmap="cividis", vmin=0, vmax=vmax)
+    metrics = []
+    for ax, name, data in zip(axes, ["unguided quadratic", "reliability-guided"], [base_sam, prop_sam]):
+        mean = float(np.mean(data))
+        p95 = float(np.percentile(data, 95))
+        metrics.append({"method": name, "mean_sam_deg": mean, "p95_sam_deg": p95})
+        ax.set_title(f"{name}\nmean={mean:.2f}°, 95th={p95:.2f}°", fontsize=8)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    cbar = fig.colorbar(im, ax=axes, fraction=.025, pad=.02)
+    cbar.set_label("spectral angular error (degrees)")
+    save_figure(fig, out, "fig_chromatic_heatmap")
+    return pd.DataFrame(metrics)
+
+
+def plot_convergence_speed(out: Path, diagnostics: pd.DataFrame) -> int:
+    residual = diagnostics.gradient_rms.to_numpy()
+    tolerance = 1e-8
+    hit = np.flatnonzero(residual <= tolerance)
+    converged = int(hit[0]) if hit.size else int(diagnostics.iteration.iloc[-1])
+    fig, ax = plt.subplots(figsize=(SINGLE, 2.45))
+    ax.semilogy(diagnostics.iteration, residual, color=GREEN,
+                label="stationarity residual")
+    ax.axhline(tolerance, color="black", ls=":", label=r"tolerance $10^{-8}$")
+    ax.axvline(converged, color=ORANGE, ls="--", lw=1)
+    ax.text(converged + 2, tolerance * 3, f"first hit: $k={converged}$", color=ORANGE)
+    ax.set(xlabel="iteration $k$", ylabel=r"$\|\nabla P(u^k)\|_2/\sqrt{CN}$")
+    ax.grid(True, which="both", alpha=.24)
+    ax.legend(loc="upper right")
+    fig.tight_layout(pad=.2)
+    save_figure(fig, out, "fig_convergence_speed")
+    return converged
+
+
+def sure_calibration() -> pd.DataFrame:
+    rng = np.random.default_rng(SEED + 7)
+    n = 128
+    t = np.linspace(0, 1, n)
+    truth = .45 + .20 * np.sin(2 * np.pi * t) + .12 * np.sin(8 * np.pi * t)
+    d = np.zeros((n - 1, n))
+    rows = np.arange(n - 1)
+    d[rows, rows] = -1
+    d[rows, rows + 1] = 1
+    lap = d.T @ d
+    eigval, eigvec = eigh(lap)
+    sigma = .18
+    gammas = np.geomspace(.01, 30, 55)
+    replications = 250
+    mse = np.empty((replications, len(gammas)))
+    sure = np.empty_like(mse)
+    for r in range(replications):
+        y = truth + rng.normal(0, sigma, n)
+        coeff = eigvec.T @ y
+        for j, gamma in enumerate(gammas):
+            filt = 1 / (1 + gamma * eigval)
+            estimate = eigvec @ (filt * coeff)
+            mse[r, j] = np.mean((estimate - truth) ** 2)
+            sure[r, j] = (np.mean((estimate - y) ** 2) - sigma ** 2
+                          + 2 * sigma ** 2 * np.mean(filt))
+    rows = []
+    for j, gamma in enumerate(gammas):
+        rows.append({
+            "gamma": gamma,
+            "mean_mse": mse[:, j].mean(),
+            "mse_se": mse[:, j].std(ddof=1) / np.sqrt(replications),
+            "mean_sure": sure[:, j].mean(),
+            "sure_se": sure[:, j].std(ddof=1) / np.sqrt(replications),
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_sure(out: Path, data: pd.DataFrame) -> None:
+    g = data.gamma.to_numpy()
+    mse = data.mean_mse.to_numpy()
+    sure = data.mean_sure.to_numpy()
+    mse_ci = 1.96 * data.mse_se.to_numpy()
+    sure_ci = 1.96 * data.sure_se.to_numpy()
+    i_oracle = int(np.argmin(mse))
+    i_sure = int(np.argmin(sure))
+    fig, ax = plt.subplots(figsize=(SINGLE, 2.55))
+    ax.semilogx(g, mse, color="black", label="mean realized MSE")
+    ax.fill_between(g, mse - mse_ci, mse + mse_ci, color="black", alpha=.12)
+    ax.semilogx(g, sure, color=BLUE, label="mean fixed-parameter SURE")
+    ax.fill_between(g, sure - sure_ci, sure + sure_ci, color=BLUE, alpha=.15)
+    ax.scatter(g[i_oracle], mse[i_oracle], color="black", marker="s", s=22, label="oracle grid point")
+    ax.scatter(g[i_sure], sure[i_sure], color=ORANGE, marker="*", s=45,
+               label="mean-SURE grid point")
+    ax.set(xlabel=r"smoothing parameter $\gamma$", ylabel="risk per sample")
+    ax.grid(True, which="both", alpha=.22)
+    ax.legend(loc="upper left")
+    fig.tight_layout(pad=.2)
+    save_figure(fig, out, "fig_sure_optimization")
+
+
+def plot_nonlocal_graph(out: Path) -> None:
+    fig, ax = plt.subplots(figsize=(SINGLE, 2.7))
+    ax.set_xlim(-.5, 9.5)
+    ax.set_ylim(-.5, 7.5)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    for i in range(10):
+        for j in range(8):
+            ax.add_patch(Rectangle((i - .5, j - .5), 1, 1, fill=False,
+                                   ec="#BBBBBB", lw=.25))
+    ref = (2, 5)
+    neighbors = [(7, 6, "r", .85), (4, 1.5, "s", .60), (8, 2, "t", .45)]
+    ax.add_patch(Rectangle((ref[0] - 1.25, ref[1] - 1.25), 2.5, 2.5,
+                           fc="#F0E442", ec="#B79F00", alpha=.42))
+    ax.scatter(*ref, color="black", s=18, zorder=4)
+    ax.text(ref[0], ref[1] + 1.45, r"reference $P_p$", ha="center")
+    for x, y, idx, weight in neighbors:
+        ax.add_patch(Rectangle((x - 1.0, y - 1.0), 2.0, 2.0,
+                               fc="#A6DBA0", ec=GREEN, alpha=.38))
+        ax.scatter(x, y, color="black", s=14, zorder=4)
+        ax.plot([ref[0], x], [ref[1], y], color=BLUE, lw=.7 + 2 * weight)
+        mx, my = (ref[0] + x) / 2, (ref[1] + y) / 2
+        ax.text(mx, my + .18, rf"$w_{{p{idx}}}=w_{{{idx}p}}={weight:.2f}$",
+                color=BLUE, ha="center", fontsize=6.5,
+                bbox=dict(fc="white", ec="none", alpha=.8, pad=.3))
+    fig.tight_layout(pad=.1)
+    save_figure(fig, out, "fig_nl_graph_topology")
+
+
+def main() -> None:
+    # ----------------------------------------------------
+    # Colab Compatibility Modification
+    # ----------------------------------------------------
+    out_dir = "figures"
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    configure_style()
+
+    truth, noisy, sigma, weights, guide = synthetic_equal_edge_problem()
+    lap = neumann_laplacian(truth.shape[1]).tocsr()
+    baseline, _, _ = solve_quadratic_followers(noisy, guide, lap, .20, 0.0, .05)
+    proposed, _, _ = solve_quadratic_followers(noisy, guide, lap, .20, 1.0, .05)
+    diagnostics, constants = quadratic_diagnostics(noisy, guide, lap)
+    diagnostics.to_csv(out / "solver_diagnostics.csv", index=False)
+
+    sure = sure_calibration()
+    sure.to_csv(out / "sure_calibration.csv", index=False)
+
+    print("Generating figures...")
+    plot_topology(out)
+    plot_bilevel_landscape(out)
+    plot_nonlocal_graph(out)
+    plot_resolvent(out)
+    plot_skewed_manifold(out)
+    plot_potential_descent(out, diagnostics)
+    plot_geometric_convergence(out, diagnostics, constants)
+    plot_reaction_curves(out)
+    heatmap_metrics = plot_heatmap(out, truth, baseline, proposed)
+    heatmap_metrics.to_csv(out / "heatmap_metrics.csv", index=False)
+    converged = plot_convergence_speed(out, diagnostics)
+    plot_sure(out, sure)
+
+    metadata = {
+        "seed": SEED,
+        "scope": "controlled specializations and diagnostics; not full Algorithm 1",
+        "synthetic_noise_sigma": sigma.tolist(),
+        "inverse_variance_guide_weights": weights.tolist(),
+        "quadratic_parameters": {"alpha": .20, "xi": 1.0, "rho": .05},
+        "convergence_constants": constants,
+        "residual_tolerance": 1e-8,
+        "first_residual_hit": converged,
+        "scalar_parameters": scalar_parameters(),
+    }
+    (out / "figure_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(heatmap_metrics.to_string(index=False))
+    print(json.dumps(metadata, indent=2))
     
     # ----------------------------------------------------
-    # ALGORITHM A: Symmetric Nash Baseline
-    # Independent updates lacking a global exact potential
+    # Colab Zip and Download
     # ----------------------------------------------------
-    u_nash = np.copy(Y)
-    nash_energies = []
-    for k in range(iters):
-        u_next = np.copy(u_nash)
-        energy = 0
-        for c in range(3):
-            grad = 1.0 * (u_nash[c] - Y[c]) # Fidelity
-            for d in range(3):
-                if c != d:
-                    grad += 2.5 * (u_nash[c] - u_nash[d]) # High opponent coupling
-            
-            # Independent Nash Update
-            u_next[c] = u_nash[c] - tau * grad
-            
-            # Record Energy
-            energy += 0.5 * np.sum((u_nash[c] - Y[c])**2)
-            for d in range(c+1, 3):
-                energy += 1.25 * np.sum((u_nash[c] - u_nash[d])**2)
-                
-        # 8-bit Hardware Clipping \Pi_C
-        u_nash = np.clip(u_next, 0, 255.0) 
-        nash_energies.append(energy)
-        
-    # ----------------------------------------------------
-    # ALGORITHM B: Adaptive Stackelberg (Algorithm 1)
-    # Simultaneous Projected Gradient Play with Exact Potential
-    # ----------------------------------------------------
-    u_stack = np.copy(Y)
-    stack_energies = []
+    zip_filename = "Stackelberg_Figures_Output"
+    print(f"\nZipping output directory to {zip_filename}.zip...")
+    shutil.make_archive(zip_filename, 'zip', out_dir)
     
-    # Phase 1: Implicit Hypergradient Adaptation
-    # We apply the optimal reliability weights q^*.
-    # Emphasizes Green/Luma dominanace but maintains adaptive C-channel mixing.
-    q_opt = np.array([0.1, 1.5, 0.2], dtype=np.float64)
-    a = np.exp(q_opt) / np.sum(np.exp(q_opt)) # Softmax \Delta_C mapping
-    
-    # Structural Guide (Leader Prior)
-    g = a[0]*Y[0] + a[1]*Y[1] + a[2]*Y[2]
-    
-    # Phase 2: Exact Potential Descent
-    for k in range(iters):
-        u_next = np.copy(u_stack)
-        energy = 0
-        for c in range(3):
-            # Gradient WITH Leader: Fidelity + Guide Constraint + Opponent Coupling
-            grad = 1.0 * (u_stack[c] - Y[c]) + 3.0 * (u_stack[c] - g)
-            for d in range(3):
-                if c != d:
-                    grad += 0.5 * (u_stack[c] - u_stack[d])
-                    
-            # Simultaneous Update
-            u_next[c] = u_stack[c] - tau * grad
-            
-            # Exact Potential Energy Calculation (Theorem 4)
-            energy += 0.5 * np.sum((u_stack[c] - Y[c])**2)
-            energy += 1.5 * np.sum((u_stack[c] - g)**2)
-            for d in range(c+1, 3):
-                energy += 0.25 * np.sum((u_stack[c] - u_stack[d])**2)
-                
-        # 8-bit Hardware Clipping \Pi_C
-        u_stack = np.clip(u_next, 0, 255.0) 
-        stack_energies.append(energy)
-        
-    return true_X, Y, u_nash, nash_energies, u_stack, stack_energies
+    if IN_COLAB:
+        print("Downloading zip file...")
+        files.download(f"{zip_filename}.zip")
+    else:
+        print(f"Not running in Google Colab. Zip file created locally at {zip_filename}.zip")
 
-def calculate_mae(u, true_X):
-    """Computes exact Mean Angular Error (MAE) per pixel between RGB vectors"""
-    C, H, W = u.shape
-    u_flat = u.reshape(3, -1)
-    t_flat = true_X.reshape(3, -1)
-    
-    dot = np.sum(u_flat * t_flat, axis=0)
-    norm_u = np.linalg.norm(u_flat, axis=0)
-    norm_t = np.linalg.norm(t_flat, axis=0)
-    
-    # Prevent div-by-zero, compute inverse cosine for angle
-    cos_theta = np.clip(dot / (norm_u * norm_t + 1e-8), -1.0, 1.0)
-    angular_error = np.arccos(cos_theta) * (180.0 / np.pi)
-    
-    return angular_error.reshape(H, W)
-
-# Run the unified solver once to generate data for both empirical plots
-TRUE_X, Y_NOISY, U_NASH, E_NASH, U_STACK, E_STACK = run_numerical_solvers()
-
-
-# ==========================================
-# Empirical Figure 8: Chromatic Heatmap
-# ==========================================
-def plot_chromatic_heatmap():
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 10))
-    
-    # Calculate real mathematical MAE using solver outputs
-    vtv_error = calculate_mae(U_NASH, TRUE_X)
-    stack_error = calculate_mae(U_STACK, TRUE_X)
-    
-    vmin, vmax = 0, 15
-    sns.heatmap(vtv_error, ax=ax1, cmap='coolwarm', vmin=vmin, vmax=vmax, cbar=True, 
-                xticklabels=False, yticklabels=False, cbar_kws={'label': 'Mean Angular Error (Degrees)'})
-    ax1.set_title("Symmetric Nash Game (VTV)\nIndependent updates hit hardware ceiling", fontweight='bold')
-    
-    sns.heatmap(stack_error, ax=ax2, cmap='coolwarm', vmin=vmin, vmax=vmax, cbar=True, 
-                xticklabels=False, yticklabels=False, cbar_kws={'label': 'Mean Angular Error (Degrees)'})
-    ax2.set_title("Adaptive Stackelberg (Proposed)\nGuide Matrix neutralizes chromatic boundary error", fontweight='bold')
-    
-    plt.tight_layout()
-    save_fig(fig, "fig_chromatic_heatmap.png")
-    plt.close()
-
-# ==========================================
-# Empirical Figure 9: Convergence Speed
-# ==========================================
-def plot_convergence_speed():
-    fig, ax = plt.subplots(figsize=(8, 6))
-    iterations = np.arange(len(E_STACK))
-    
-    # Plot real trajectory data extracted directly from the discrete PDE solver
-    ax.plot(iterations, E_NASH, color='#e74c3c', linewidth=2.5, label='Symmetric Nash Game (VTV Baseline)')
-    ax.plot(iterations, E_STACK, color='#27ae60', linewidth=3.5, label='Adaptive Stackelberg Exact Potential')
-    
-    # Threshold extraction
-    threshold = E_STACK[-1] * 1.01 
-    ax.axhline(threshold, color='black', linestyle=':', label=r'FP64 Tolerance Limit ($\varepsilon$)')
-    
-    stack_conv_idx = np.argmax(np.array(E_STACK) <= threshold)
-    ax.scatter(iterations[stack_conv_idx], E_STACK[stack_conv_idx], color='#27ae60', s=100, zorder=5)
-    ax.annotate(f'Converged: {stack_conv_idx} Iterations', xy=(iterations[stack_conv_idx], E_STACK[stack_conv_idx]), 
-                xytext=(iterations[stack_conv_idx]+10, E_STACK[stack_conv_idx]+(E_STACK[0]*0.1)),
-                arrowprops=dict(facecolor='#27ae60', shrink=0.05, width=1.5, headwidth=6), fontweight='bold')
-    
-    ax.set_title("Algorithmic Stability: Discrete Energy Dissipation", fontweight='bold', pad=15)
-    ax.set_xlabel("Solver Iterations ($k$)")
-    ax.set_ylabel("Global System Energy / Cost Functional")
-    ax.legend(loc='upper right')
-    ax.grid(True, linestyle='--', alpha=0.6)
-    
-    save_fig(fig, "fig_convergence_speed.png")
-    plt.close()
-
-
-# ==========================================
-# Topological & Geometric Figures (1-7, 10-11)
-# ==========================================
-def plot_topology():
-    fig, ax = plt.subplots(figsize=(6, 5))
-    G = nx.DiGraph()
-    G.add_nodes_from(['Adaptive\nGuide (g)', 'Channel 1\n(Follower)', 'Channel 2\n(Follower)'])
-    G.add_edges_from([('Adaptive\nGuide (g)', 'Channel 1\n(Follower)'), 
-                      ('Adaptive\nGuide (g)', 'Channel 2\n(Follower)')])
-    
-    pos = {'Adaptive\nGuide (g)': (0, 1), 'Channel 1\n(Follower)': (-1, 0), 'Channel 2\n(Follower)': (1, 0)}
-    
-    nx.draw_networkx_nodes(G, pos, nodelist=['Adaptive\nGuide (g)'], node_color='#2ecc71', node_size=3500, edgecolors='black', linewidths=2)
-    nx.draw_networkx_nodes(G, pos, nodelist=['Channel 1\n(Follower)', 'Channel 2\n(Follower)'], node_color=['#e74c3c', '#3498db'], node_size=3000, edgecolors='black', linewidths=2)
-    nx.draw_networkx_labels(G, pos, font_weight='bold', font_color='white', font_size=10)
-    nx.draw_networkx_edges(G, pos, arrowsize=25, width=3, edge_color='#7f8c8d')
-    
-    plt.text(0, 0.5, 'CFL Stable\n' + r'Reaction Mappings $\mathcal{R}_i$', 
-             horizontalalignment='center', verticalalignment='center', 
-             fontsize=10, bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray', boxstyle='round,pad=0.5'))
-             
-    plt.title("Hardware Topology: Stackelberg Information Flow", pad=20, fontweight='bold')
-    plt.axis('off')
-    save_fig(fig, "fig_stackelberg_topology.png")
-    plt.close()
-
-def plot_bilevel_landscape():
-    fig = plt.figure(figsize=(9, 7))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    u_g = np.linspace(-2.5, 2.5, 60, dtype=np.float64)
-    u_f = np.linspace(-2.5, 2.5, 60, dtype=np.float64)
-    X, Y = np.meshgrid(u_g, u_f)
-    
-    boundary_damping = np.exp(-0.05 * (X**4 + Y**4))
-    Z = ((X**2 + 0.5 * Y**2) + 2 * np.sin(X*Y)) * boundary_damping
-    
-    R_ug = 0.5 * u_g + np.sin(u_g)
-    Z_manifold = ((u_g**2 + 0.5 * R_ug**2) + 2 * np.sin(u_g*R_ug)) * np.exp(-0.05 * (u_g**4 + R_ug**4))
-    
-    ax.plot_surface(X, Y, Z, alpha=0.4, cmap='viridis', edgecolor='none')
-    ax.plot(u_g, R_ug, Z_manifold + 0.2, color='cyan', linewidth=4, label=r"Followers' Reaction Manifold $\mathcal{R}_{\mathcal{F}}(g)$", zorder=5)
-    
-    min_idx = np.argmin(Z_manifold)
-    ax.scatter(u_g[min_idx], R_ug[min_idx], Z_manifold[min_idx] + 0.2, color='red', s=150, label='Stackelberg Equilibrium', zorder=10)
-    
-    ax.set_xlabel(r"Leader Strategy (Guide) $g$")
-    ax.set_ylabel(r"Follower Strategy $u_{\mathcal{F}}$")
-    ax.set_zlabel(r"Leader Objective $\widehat{J}$")
-    ax.set_title("FP64 Bilevel Landscape with Boundary Damping", fontweight='bold')
-    ax.legend(loc='upper right')
-    ax.view_init(elev=25, azim=135)
-    save_fig(fig, "fig_bilevel_landscape.png")
-    plt.close()
-
-def plot_resolvent_projection():
-    fig = plt.figure(figsize=(9, 7))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    grid_pts = np.linspace(-2.5, 2.5, 40, dtype=np.float64)
-    X, Y = np.meshgrid(grid_pts, grid_pts)
-    Z_manifold = np.sin(X) * np.cos(Y) * 0.5
-    
-    ax.plot_wireframe(X, Y, Z_manifold, color='#2980b9', alpha=0.4, linewidth=0.8)
-    ax.plot_surface(X, Y, Z_manifold, alpha=0.3, cmap='Blues', edgecolors='none')
-    
-    np.random.seed(42)
-    noise_x = np.random.uniform(-1.5, 1.5, 20)
-    noise_y = np.random.uniform(-1.5, 1.5, 20)
-    noise_z = np.sin(noise_x) * np.cos(noise_y) * 0.5 + np.random.uniform(1.5, 2.5, 20)
-    
-    ax.scatter(noise_x, noise_y, noise_z, color='#e74c3c', s=40, label=r'Perturbed Hardware State $Y_c \in L^2(\Omega)$', alpha=0.8)
-    
-    proj_z = np.sin(noise_x) * np.cos(noise_y) * 0.5
-    ax.scatter(noise_x, noise_y, proj_z, color='#27ae60', s=60, label=r'Proximal Map $\mathcal{R}_c(Y_c) \in W^{1,2}(\Omega)$', zorder=5)
-    
-    for nx, ny, nz, pz in zip(noise_x, noise_y, noise_z, proj_z):
-        ax.plot([nx, nx], [ny, ny], [nz, pz], color='black', linestyle=':', alpha=0.6)
-              
-    ax.set_title("FP64 Resolvent Projection onto Discrete Sobolev Manifold", pad=20, fontweight='bold')
-    ax.set_xlabel("Spatial Grid X")
-    ax.set_ylabel("Spatial Grid Y")
-    ax.set_zlabel("Energy / Intensity")
-    ax.legend(loc='upper right', bbox_to_anchor=(1.1, 1))
-    ax.view_init(elev=20, azim=-60)
-    save_fig(fig, "fig_resolvent_projection.png")
-    plt.close()
-
-def plot_skewed_manifold():
-    fig = plt.figure(figsize=(9, 7))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    grid_pts = np.linspace(-2.5, 2.5, 45, dtype=np.float64)
-    X, Y = np.meshgrid(grid_pts, grid_pts)
-    Z_skewed = (X - Y)**2 * 1.5 + (X + Y)**2 * 0.15 
-    
-    ax.plot_surface(X, Y, Z_skewed, alpha=0.65, cmap='magma', edgecolors='none')
-    ax.plot_wireframe(X, Y, Z_skewed, color='black', alpha=0.15, linewidth=0.5)
-    
-    line_x = np.linspace(-2.5, 2.5, 100, dtype=np.float64)
-    line_y = line_x
-    line_z = (line_x - line_y)**2 * 1.5 + (line_x + line_y)**2 * 0.15
-    
-    ax.plot(line_x, line_y, line_z, color='cyan', linewidth=5, label="Structural Guide Subspace", zorder=5)
-    ax.quiver(-1.5, 1.5, Z_skewed[10, 35], 1.5, -1.5, -Z_skewed[10, 35] + line_z[20], 
-              color='white', arrow_length_ratio=0.1, linewidth=3, label="Skewed Gradient Descent")
-    
-    ax.set_title("Anisotropic Projection Matrix (Strategic Noise Manifold)", pad=20, fontweight='bold')
-    ax.axis('off')
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=2)
-    ax.view_init(elev=35, azim=45)
-    save_fig(fig, "fig_skewed_manifold.png")
-    plt.close()
-
-def plot_potential_descent():
-    fig, ax = plt.subplots(figsize=(7, 5))
-    iterations = np.arange(len(E_STACK))
-    
-    ax.plot(iterations, E_STACK, color='#8e44ad', linewidth=3.5, label=r'Global Potential $P(u_{\mathcal{F}})$')
-    ax.scatter(iterations[::20], np.array(E_STACK)[::20], color='white', edgecolor='#8e44ad', s=80, zorder=5)
-    
-    ax.set_title("Exact Potential Game: Monotonic Energy Dissipation", fontweight='bold', pad=15)
-    ax.set_xlabel("Solver Iterations ($k$)")
-    ax.set_ylabel("Total System Energy (Joules/Units)")
-    ax.grid(True, linestyle='--', alpha=0.6)
-    ax.legend()
-    
-    ax.annotate(r'$\delta P \leq 0$ (No Cyclic Behavior)', xy=(20, E_STACK[20]), xytext=(40, E_STACK[20]*1.5),
-                arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=8),
-                fontsize=11, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.9))
-    save_fig(fig, "fig_potential_descent.png")
-    plt.close()
-
-def plot_geometric_convergence():
-    fig, ax = plt.subplots(figsize=(7, 5))
-    iterations = np.arange(0, 100) # Length 100 array (0 to 99)
-    mu_L_ratio = 0.08
-    theoretical_bound = (1 - mu_L_ratio)**iterations
-    
-    np.random.seed(10)
-    empirical_stable = theoretical_bound * np.random.uniform(0.85, 1.0, size=len(iterations))
-    
-    empirical_unstable = np.zeros(len(iterations))
-    empirical_unstable[:15] = (1 - 0.05)**np.arange(15) 
-    # Remaining slice has length 100 - 15 = 85
-    empirical_unstable[15:] = empirical_unstable[14] * (1.15)**np.arange(1, 86) 
-    
-    ax.semilogy(iterations, theoretical_bound, color='black', linestyle='--', linewidth=2, label=r'Theoretical Bound $(1 - \mu/L_P)^k$')
-    ax.semilogy(iterations, empirical_stable, color='#2980b9', linewidth=3, label=r'Stable FP64 Execution ($\tau \leq 2/L_P$)')
-    ax.semilogy(iterations[:45], empirical_unstable[:45], color='#e74c3c', linewidth=2.5, linestyle='-.', label='Hardware CFL Violation')
-    
-    ax.set_title("Empirical Verification of Geometric Convergence", fontweight='bold', pad=15)
-    ax.set_xlabel("Solver Iterations ($k$)")
-    ax.set_ylabel(r"Distance to Equilibrium $\|u^{(k)} - u^\star\|_2^2$ (Log)", fontsize=10)
-    ax.grid(True, which="both", ls="--", alpha=0.5)
-    ax.legend(loc='lower left')
-    save_fig(fig, "fig_geometric_convergence.png")
-    plt.close()
-
-def plot_reaction_curves():
-    fig, ax = plt.subplots(figsize=(8, 8))
-    I_R = 120.0  
-    I_G = 160.0  
-    lambda_R = 1.0
-    lambda_G = 1.2
-    gamma = 2.0
-    
-    y_vals = np.linspace(0, 255, 400, dtype=np.float64) 
-    x_vals = np.linspace(0, 255, 400, dtype=np.float64) 
-    
-    slope_R = gamma / (lambda_R + gamma)
-    R_R = (lambda_R / (lambda_R + gamma)) * I_R + slope_R * y_vals
-    
-    slope_G = gamma / (lambda_G + gamma)
-    R_G = (lambda_G / (lambda_G + gamma)) * I_G + slope_G * x_vals
-    
-    ax.plot(y_vals, R_R, color='#e74c3c', linewidth=3, label=r"Follower (Red) Reaction $\mathcal{R}_R(y)$")
-    ax.plot(R_G, x_vals, color='#3498db', linewidth=3, linestyle='--', label=r"Reactive Leader (Nash) $\mathcal{R}_G(x)$")
-    
-    y_NE = (lambda_G * I_G * (lambda_R + gamma) + gamma * lambda_R * I_R) / ((lambda_G + gamma) * (lambda_R + gamma) - gamma**2)
-    x_NE = (lambda_R / (lambda_R + gamma)) * I_R + slope_R * y_NE
-    ax.scatter(y_NE, x_NE, color='black', s=100, zorder=5)
-    ax.annotate('Nash Equilibrium (NE)', xy=(y_NE, x_NE), xytext=(y_NE - 35, x_NE + 15),
-                arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=7), fontsize=11, fontweight='bold')
-    
-    coef_1 = lambda_G
-    coef_2 = gamma * (1 - slope_R)**2
-    y_SE = (lambda_G * I_G + gamma * (1 - slope_R) * (lambda_R / (lambda_R + gamma)) * I_R) / (coef_1 + coef_2)
-    x_SE = (lambda_R / (lambda_R + gamma)) * I_R + slope_R * y_SE
-    
-    ax.scatter(y_SE, x_SE, color='#27ae60', s=130, marker='*', zorder=6)
-    ax.annotate('Stackelberg Equilibrium (SE)', xy=(y_SE, x_SE), xytext=(y_SE + 10, x_SE - 25),
-                arrowprops=dict(facecolor='#27ae60', shrink=0.05, width=1.5, headwidth=7),
-                fontsize=11, fontweight='bold', color='#27ae60')
-    
-    Y_grid, X_grid = np.meshgrid(y_vals, x_vals)
-    J_G_grid = 0.5 * lambda_G * (Y_grid - I_G)**2 + 0.5 * gamma * (Y_grid - X_grid)**2
-    J_G_SE = 0.5 * lambda_G * (y_SE - I_G)**2 + 0.5 * gamma * (y_SE - x_SE)**2
-    levels = [J_G_SE, J_G_SE + 200, J_G_SE + 800, J_G_SE + 2000, J_G_SE + 4000]
-    
-    CS = ax.contour(Y_grid, X_grid, J_G_grid, levels=levels, colors='#2ecc71', alpha=0.6, linewidths=1.5)
-    ax.plot([], [], color='#2ecc71', label=r"Leader Iso-Cost Contours $\widehat{J}$") 
-    
-    ax.set_title("Computational Geometry of the Pixel Duopoly", fontweight='bold', pad=15)
-    ax.set_xlabel("Leader Strategy (Guide Intensity $y$)")
-    ax.set_ylabel("Follower Strategy (Channel Intensity $x$)")
-    
-    ax.set_xlim(0, 255)
-    ax.set_ylim(0, 255)
-    ax.legend(loc='lower right')
-    ax.grid(True, linestyle=':', alpha=0.7)
-    ax.set_aspect('equal', adjustable='box')
-    
-    save_fig(fig, "fig_reaction_curves.png")
-    plt.close()
-
-def plot_sure_landscape():
-    fig, ax = plt.subplots(figsize=(8, 6))
-    gamma_vals = np.linspace(0.1, 5.0, 200, dtype=np.float64)
-    true_mse = 15.0 * (gamma_vals - 2.5)**2 + 45.0
-    
-    np.random.seed(42)
-    sure_noise = np.random.normal(0, 4.0, size=len(gamma_vals)) * np.exp(-0.2 * gamma_vals)
-    sure_estimate = true_mse + sure_noise - 2.0 
-    
-    ax.plot(gamma_vals, true_mse, color='black', linewidth=3, label='True Unobservable MSE (Oracle)')
-    ax.scatter(gamma_vals[::3], sure_estimate[::3], color='#3498db', s=30, alpha=0.8, label='Multichannel SURE Estimate')
-    
-    min_true_idx = np.argmin(true_mse)
-    min_sure_idx = np.argmin(sure_estimate)
-    
-    ax.axvline(gamma_vals[min_true_idx], color='black', linestyle=':', alpha=0.6)
-    ax.axvline(gamma_vals[min_sure_idx], color='#e74c3c', linestyle='--', linewidth=2)
-    
-    ax.scatter(gamma_vals[min_true_idx], true_mse[min_true_idx], color='black', s=100, zorder=5)
-    ax.scatter(gamma_vals[min_sure_idx], sure_estimate[min_sure_idx], color='#e74c3c', s=120, marker='*', zorder=6, label='SURE-Selected Parameter')
-    
-    ax.set_title("SURE-Guided Hyperparameter Adaptation", fontweight='bold', pad=15)
-    ax.set_xlabel(r"Stackelberg Coupling Strength ($\gamma_{NL}$)")
-    ax.set_ylabel("Risk / Error Metric")
-    ax.legend(loc='upper center')
-    ax.grid(True, linestyle='--', alpha=0.5)
-    save_fig(fig, "fig_sure_optimization.png")
-    plt.close()
-
-def plot_nl_graph_topology():
-    fig, ax = plt.subplots(figsize=(8, 8))
-    grid_size = 10
-    ax.set_xlim(-1, grid_size)
-    ax.set_ylim(-1, grid_size)
-    
-    for x in range(grid_size):
-        for y in range(grid_size):
-            ax.add_patch(Rectangle((x - 0.5, y - 0.5), 1, 1, fill=False, edgecolor='gray', alpha=0.2))
-            
-    ref_center = (2, 7)
-    ax.add_patch(Rectangle((ref_center[0] - 1.5, ref_center[1] - 1.5), 3, 3, fill=True, facecolor='#f1c40f', alpha=0.4, edgecolor='#f39c12', linewidth=2))
-    ax.scatter(*ref_center, color='black', s=50, zorder=5)
-    ax.text(ref_center[0], ref_center[1] + 1.8, r'Reference Patch $P_p$', ha='center', fontweight='bold')
-    
-    similar_patches = [(7, 8), (4, 2), (8, 3)]
-    weights = [0.85, 0.60, 0.45] 
-    
-    for patch, w in zip(similar_patches, weights):
-        ax.add_patch(Rectangle((patch[0] - 1.5, patch[1] - 1.5), 3, 3, fill=True, facecolor='#2ecc71', alpha=0.3, edgecolor='#27ae60', linewidth=1.5))
-        ax.scatter(*patch, color='black', s=30, zorder=5)
-        ax.plot([ref_center[0], patch[0]], [ref_center[1], patch[1]], color='#3498db', linewidth=w * 5, linestyle='-', zorder=4)
-        mid_x = (ref_center[0] + patch[0]) / 2
-        mid_y = (ref_center[1] + patch[1]) / 2
-        ax.text(mid_x, mid_y + 0.3, rf'$w_{{pq}} = {w:.2f}$', ha='center', color='#2980b9', fontweight='bold', bbox=dict(facecolor='white', edgecolor='none', alpha=0.8, pad=1))
-               
-    ax.set_title(r"Leader-Induced Symmetric Non-Local Graph ($L_G$)", fontweight='bold', pad=15)
-    ax.axis('off')
-    save_fig(fig, "fig_nl_graph_topology.png")
-    plt.close()
-
-# ==========================================
-# Execution and Zip Packaging
-# ==========================================
-print("Generating 11 rigorous figures for IEEE TSP compliance...")
-plot_topology()
-plot_bilevel_landscape()
-plot_resolvent_projection()
-plot_skewed_manifold()
-plot_potential_descent()
-plot_geometric_convergence()
-plot_reaction_curves()
-plot_chromatic_heatmap()
-plot_convergence_speed()
-plot_sure_landscape()
-plot_nl_graph_topology()
-
-zip_filename = "IEEE_TSP_Figures_Final"
-shutil.make_archive(zip_filename, 'zip', FIG_DIR)
-print(f"Packaging complete. Downloading {zip_filename}.zip...")
-files.download(f"{zip_filename}.zip")
+if __name__ == "__main__":
+    main()
